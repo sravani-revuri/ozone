@@ -150,8 +150,8 @@ public class TestTracingInitModes {
     // Step 2: INCOMING_ONLY — reject roots, accept imported client context.
     TracingUtil.initServiceTracing("scm", tracingConfig(false, true));
     assertThat(TracingUtil.shouldInstallTraceProxy(conf(false, true)))
-        .as("incoming-only init should enable trace proxy")
-        .isTrue();
+        .as("server incoming-only alone must not wrap client RPC proxies")
+        .isFalse();
 
     assertThat(TracingUtil.importAndCreateSpan("server-op", "").getSpanContext().isValid())
         .as("incoming-only must not start root spans without client trace context")
