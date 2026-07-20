@@ -13,27 +13,95 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Runs test-repair-tools.sh multiple times on push to sampletest.
+# Mirrors upstream repeat-acceptance-test + CI acceptance env vars.
+
 name: repeat-repair-tools-sampletest
 
 on:
   push:
     branches:
       - sampletest
+  workflow_dispatch:
+    inputs:
+      splits:
+        description: Number of parallel test runs
+        default: '10'
+        required: true
+      fail-fast:
+        description: Stop after first failure
+        default: false
+        required: true
 
 env:
-  MAVEN_OPTS: -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false
+  MAVEN_OPTS: -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.http.retryHandler.class=standard -Dmaven.wagon.http.retryHandler.count=3
+  MAVEN_ARGS: --batch-mode --settings ${{ github.workspace }}/dev-support/ci/maven-settings.xml
   JAVA_VERSION: '25'
-  ITERATIONS: 10
+  OZONE_VOLUME_OWNER: '1000'
+  COMPOSE_PARALLEL_LIMIT: '1'
+  OZONE_TEST_SELECTOR: repair-tools
+  SPLITS: ${{ github.event.inputs.splits || '10' }}
+  FAIL_FAST: ${{ github.event.inputs.fail-fast || 'false' }}
 
 permissions: {}
 
 jobs:
+  prepare-job:
+    name: prepare
+    runs-on: ubuntu-slim
+    outputs:
+      matrix: ${{ steps.generate.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify repair-tools test exists
+        run: |
+          cd hadoop-ozone/dist/src/main/compose
+          source testlib.sh
+          export OZONE_TEST_SELECTOR=repair-tools
+          tests=$(find_tests)
+          echo "Matched tests: ${tests}"
+          if [[ -z "${tests}" ]]; then
+            echo "ERROR: No test matched OZONE_TEST_SELECTOR=repair-tools"
+            exit 1
+          fi
+          echo "${tests}" | grep -q 'test-repair-tools.sh'
+
+      - name: Generate test matrix
+        id: generate
+        run: |
+          splits=()
+          for ((i = 1; i <= SPLITS; i++)); do
+            splits+=("$i")
+          done
+          printf -v x '%s,' "${splits[@]}"
+          split_matrix="[${x%,}]"
+          echo "matrix=${split_matrix}" >> "${GITHUB_OUTPUT}"
+
   build:
+    name: build
+    needs: prepare-job
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Cache Maven
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository/*/*/*
+            !~/.m2/repository/org/apache/ozone
+          key: maven-repo-${{ hashFiles('**/pom.xml') }}-${{ env.JAVA_VERSION }}
+          restore-keys: |
+            maven-repo-${{ hashFiles('**/pom.xml') }}
+            maven-repo-
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -41,16 +109,15 @@ jobs:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
 
-      - name: Cache Maven
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2/repository
-          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            maven-${{ runner.os }}-
-
       - name: Build Ozone dist
         run: hadoop-ozone/dev-support/checks/build.sh -Pdist -Psrc -Dmaven.javadoc.skip=true
+
+      - name: Verify dist tarball and keytabs exist
+        run: |
+          ls -la hadoop-ozone/dist/target/ozone-*.tar.gz
+          OZONE_VERSION=$(mvn help:evaluate -Dexpression=ozone.version -q -DforceStdout -Dscan=false)
+          test -d "hadoop-ozone/dist/target/ozone-${OZONE_VERSION}/compose/_keytabs" \
+            || test -d "hadoop-ozone/dist/target/ozone-${OZONE_VERSION}/compose/ozonesecure-ha/../_keytabs"
 
       - name: Upload dist tarball
         uses: actions/upload-artifact@v4
@@ -61,42 +128,77 @@ jobs:
             !hadoop-ozone/dist/target/ozone-*-src.tar.gz
           retention-days: 3
 
-  test-repair-tools:
-    needs: build
+  acceptance:
+    name: test-run-${{ matrix.split }}
+    needs:
+      - prepare-job
+      - build
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 150
     strategy:
-      fail-fast: false
+      fail-fast: ${{ fromJson(env.FAIL_FAST) }}
       matrix:
-        iteration: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    name: test-run-${{ matrix.iteration }}
+        split: ${{ fromJson(needs.prepare-job.outputs.matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      - name: Download dist
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Cache Maven
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository/*/*/*
+            !~/.m2/repository/org/apache/ozone
+          key: maven-repo-${{ hashFiles('**/pom.xml') }}-${{ env.JAVA_VERSION }}
+          restore-keys: |
+            maven-repo-${{ hashFiles('**/pom.xml') }}
+            maven-repo-
+
+      - name: Download dist tarball
         uses: actions/download-artifact@v4
         with:
           name: ozone-bin
 
-      - name: Extract dist
+      - name: Extract dist and fix permissions
         run: |
           mkdir -p hadoop-ozone/dist/target
           tar xzf ozone-*.tar.gz -C hadoop-ozone/dist/target
-          OZONE_DIR=$(find hadoop-ozone/dist/target -maxdepth 1 -type d -name 'ozone-*' | head -1)
-          echo "OZONE_DIR=$OZONE_DIR" >> "$GITHUB_ENV"
+          rm -f ozone-*.tar.gz
+          sudo chmod -R a+rwX hadoop-ozone/dist/target
+          OZONE_VERSION=$(mvn help:evaluate -Dexpression=ozone.version -q -DforceStdout -Dscan=false)
+          echo "OZONE_VERSION=${OZONE_VERSION}" >> "${GITHUB_ENV}"
+          ls -la "hadoop-ozone/dist/target/ozone-${OZONE_VERSION}/compose/ozonesecure-ha/"
 
-      - name: Run test-repair-tools.sh (iteration ${{ matrix.iteration }})
-        run: |
-          cd "${OZONE_DIR}/compose/ozonesecure-ha"
-          ./test-repair-tools.sh
+      - name: Execute repair-tools acceptance test
+        run: ./hadoop-ozone/dev-support/checks/acceptance.sh
+        env:
+          KEEP_IMAGE: false
 
-      - name: Upload logs on failure
+      - name: Debug docker on failure
         if: failure()
+        run: |
+          COMPOSE_DIR="hadoop-ozone/dist/target/ozone-${OZONE_VERSION}/compose/ozonesecure-ha"
+          if [[ -d "${COMPOSE_DIR}" ]]; then
+            cd "${COMPOSE_DIR}"
+            docker compose ps -a || true
+            docker compose logs kdc --tail 100 || true
+            docker compose logs scm1.org --tail 300 || true
+            docker compose logs om1 --tail 100 || true
+          fi
+
+      - name: Archive test results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: repair-tools-logs-run-${{ matrix.iteration }}
-          path: |
-            hadoop-ozone/dist/target/ozone-*/compose/ozonesecure-ha/result/
+          name: acceptance-${{ matrix.split }}
+          path: target/acceptance/
           if-no-files-found: ignore
           retention-days: 7
