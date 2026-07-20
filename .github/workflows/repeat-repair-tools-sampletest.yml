@@ -1,0 +1,102 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: repeat-repair-tools-sampletest
+
+on:
+  push:
+    branches:
+      - sampletest
+
+env:
+  MAVEN_OPTS: -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false
+  JAVA_VERSION: '25'
+  ITERATIONS: 10
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Cache Maven
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
+
+      - name: Build Ozone dist
+        run: hadoop-ozone/dev-support/checks/build.sh -Pdist -Psrc -Dmaven.javadoc.skip=true
+
+      - name: Upload dist tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: ozone-bin
+          path: |
+            hadoop-ozone/dist/target/ozone-*.tar.gz
+            !hadoop-ozone/dist/target/ozone-*-src.tar.gz
+          retention-days: 3
+
+  test-repair-tools:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        iteration: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    name: test-run-${{ matrix.iteration }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: ozone-bin
+
+      - name: Extract dist
+        run: |
+          mkdir -p hadoop-ozone/dist/target
+          tar xzf ozone-*.tar.gz -C hadoop-ozone/dist/target
+          OZONE_DIR=$(find hadoop-ozone/dist/target -maxdepth 1 -type d -name 'ozone-*' | head -1)
+          echo "OZONE_DIR=$OZONE_DIR" >> "$GITHUB_ENV"
+
+      - name: Run test-repair-tools.sh (iteration ${{ matrix.iteration }})
+        run: |
+          cd "${OZONE_DIR}/compose/ozonesecure-ha"
+          ./test-repair-tools.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repair-tools-logs-run-${{ matrix.iteration }}
+          path: |
+            hadoop-ozone/dist/target/ozone-*/compose/ozonesecure-ha/result/
+          if-no-files-found: ignore
+          retention-days: 7

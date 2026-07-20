@@ -1,3 +1,6 @@
+test repair tools.sh
+
+
 #!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -93,17 +96,24 @@ execute_robot_test ${OM} kinit.robot
 
 echo "Creating test keys to verify om compaction"
 om_container="ozonesecure-ha-om1-1"
-docker exec "${om_container}" ozone freon ockg -n 1000 -t 4 -s 0 > /dev/null 2>&1
+docker exec "${om_container}" ozone freon ockg -n 10000 -t 4 -s 0 > /dev/null 2>&1
 echo "Test keys created"
 
 echo "Restarting OM after key creation to flush and generate sst files"
 docker restart "${om_container}"
+wait_for_om_leader
 # Delete keys to create tombstones that need compaction
 execute_command_in_container ${OM} ozone fs -rm -R -skipTrash ofs://${OM_SERVICE_ID}/vol1/bucket1
 
+
+echo "Restarting OM after key deletion to flush memtables before measuring DB size"
+docker restart "${om_container}"
+wait_for_om_leader
+
+
 get_om_db_size() {
   execute_command_in_container ${OM} find /data/metadata/om.db -name '*.sst' -exec du -b {} + \
-      | awk '{ sum += $1}  END { print sum }'
+      | awk '{ sum += $1 } END { print sum + 0 }'
 }
 
 check_om_log() {
@@ -113,7 +123,7 @@ check_om_log() {
 compact_om_db() {
   for cf in "$@"; do
     execute_command_in_container ${OM} ozone repair om compact --cf="${cf}" --service-id "${OM_SERVICE_ID}" --node-id "${OM}" --blc 2
-    retry check_om_log "$cf"
+    RETRY_ATTEMPTS=30 retry check_om_log "$cf"
   done
 }
 
@@ -122,7 +132,7 @@ size_before_compaction=$(get_om_db_size)
 compact_om_db fileTable deletedTable deletedDirectoryTable
 size_after_compaction=$(get_om_db_size)
 
-if [[ ${size_before_compaction} -lt ${size_after_compaction} ]]; then
-  echo "OM DB size should be reduced after compaction. Before: ${size_before_compaction}, After: ${size_after_compaction}"
+if [[ ${size_after_compaction} -gt ${size_before_compaction} ]]; then
+  echo "OM DB size should not grow after compaction. Before: ${size_before_compaction}, After: ${size_after_compaction}"
   exit 1
 fi
