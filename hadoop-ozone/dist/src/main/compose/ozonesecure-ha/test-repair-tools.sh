@@ -98,12 +98,35 @@ echo "Test keys created"
 
 echo "Restarting OM after key creation to flush and generate sst files"
 docker restart "${om_container}"
-# Delete keys to create tombstones that need compaction
 execute_command_in_container ${OM} ozone fs -rm -R -skipTrash ofs://${OM_SERVICE_ID}/vol1/bucket1
 
 get_om_db_size() {
   execute_command_in_container ${OM} find /data/metadata/om.db -name '*.sst' -exec du -b {} + \
-      | awk '{ sum += $1}  END { print sum }'
+      | awk '{ sum += $1}  END { print (sum == "" ? 0 : sum) }'
+}
+
+wait_for_stable_om_db_size() {
+  local -i prev=-1 curr stable=0
+  local -i required_stable=3   # consecutive equal reads
+  local -i max_polls=40        # ~2 min at 3s interval
+  local -i i=0
+  while [[ $i -lt $max_polls ]]; do
+    curr=$(get_om_db_size)
+    if [[ ${curr} -eq ${prev} ]]; then
+      stable=$((stable + 1))
+      if [[ ${stable} -ge ${required_stable} ]]; then
+        echo "OM DB size stabilized at ${curr}"
+        return 0
+      fi
+    else
+      stable=0
+    fi
+    prev=${curr}
+    sleep 3
+    i=$((i + 1))
+  done
+  echo "WARN: OM DB size did not fully stabilize; last value ${curr}"
+  return 0
 }
 
 check_om_log() {
@@ -113,16 +136,20 @@ check_om_log() {
 compact_om_db() {
   for cf in "$@"; do
     execute_command_in_container ${OM} ozone repair om compact --cf="${cf}" --service-id "${OM_SERVICE_ID}" --node-id "${OM}" --blc 2
-    retry check_om_log "$cf"
+    RETRY_ATTEMPTS=20 RETRY_SLEEP=3 retry check_om_log "$cf"
   done
 }
 
 declare -i size_before_compaction size_after_compaction
+wait_for_stable_om_db_size
 size_before_compaction=$(get_om_db_size)
 compact_om_db fileTable deletedTable deletedDirectoryTable
+wait_for_stable_om_db_size
 size_after_compaction=$(get_om_db_size)
 
 if [[ ${size_before_compaction} -lt ${size_after_compaction} ]]; then
   echo "OM DB size should be reduced after compaction. Before: ${size_before_compaction}, After: ${size_after_compaction}"
   exit 1
 fi
+
+echo "OM DB compaction reduced size. Before: ${size_before_compaction}, After: ${size_after_compaction}"
