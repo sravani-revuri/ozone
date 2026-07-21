@@ -102,31 +102,24 @@ execute_command_in_container ${OM} ozone fs -rm -R -skipTrash ofs://${OM_SERVICE
 
 get_om_db_size() {
   execute_command_in_container ${OM} find /data/metadata/om.db -name '*.sst' -exec du -b {} + \
-      | awk '{ sum += $1}  END { print (sum == "" ? 0 : sum) }'
+      | awk '{ sum += $1}  END { print sum }'
 }
 
-wait_for_stable_om_db_size() {
-  local -i prev=-1 curr stable=0
-  local -i required_stable=3   # consecutive equal reads
-  local -i max_polls=40        # ~2 min at 3s interval
-  local -i i=0
-  while [[ $i -lt $max_polls ]]; do
-    curr=$(get_om_db_size)
-    if [[ ${curr} -eq ${prev} ]]; then
-      stable=$((stable + 1))
-      if [[ ${stable} -ge ${required_stable} ]]; then
-        echo "OM DB size stabilized at ${curr}"
-        return 0
-      fi
-    else
-      stable=0
+wait_for_om_db_size_stable() {
+  local timeout=120
+  local prev=-1
+  SECONDS=0
+  while [[ $SECONDS -lt $timeout ]]; do
+    local size
+    size=$(get_om_db_size)
+    if [[ ${size} -eq ${prev} ]]; then
+      return
     fi
-    prev=${curr}
+    prev=${size}
     sleep 3
-    i=$((i + 1))
   done
-  echo "WARN: OM DB size did not fully stabilize; last value ${curr}"
-  return 0
+  echo "Timed out waiting for OM DB size to stabilize"
+  return 1
 }
 
 check_om_log() {
@@ -136,20 +129,18 @@ check_om_log() {
 compact_om_db() {
   for cf in "$@"; do
     execute_command_in_container ${OM} ozone repair om compact --cf="${cf}" --service-id "${OM_SERVICE_ID}" --node-id "${OM}" --blc 2
-    RETRY_ATTEMPTS=20 RETRY_SLEEP=3 retry check_om_log "$cf"
+    RETRY_ATTEMPTS=10 retry check_om_log "$cf"
   done
 }
 
 declare -i size_before_compaction size_after_compaction
-wait_for_stable_om_db_size
+wait_for_om_db_size_stable
 size_before_compaction=$(get_om_db_size)
 compact_om_db fileTable deletedTable deletedDirectoryTable
-wait_for_stable_om_db_size
+wait_for_om_db_size_stable
 size_after_compaction=$(get_om_db_size)
 
 if [[ ${size_before_compaction} -lt ${size_after_compaction} ]]; then
   echo "OM DB size should be reduced after compaction. Before: ${size_before_compaction}, After: ${size_after_compaction}"
   exit 1
 fi
-
-echo "OM DB compaction reduced size. Before: ${size_before_compaction}, After: ${size_after_compaction}"
