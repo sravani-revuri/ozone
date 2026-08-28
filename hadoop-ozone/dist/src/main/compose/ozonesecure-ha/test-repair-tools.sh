@@ -98,12 +98,14 @@ echo "Test keys created"
 
 echo "Restarting OM after key creation to flush and generate sst files"
 docker restart "${om_container}"
+wait_for_om_leader
+
 # Delete keys to create tombstones that need compaction
 execute_command_in_container ${OM} ozone fs -rm -R -skipTrash ofs://${OM_SERVICE_ID}/vol1/bucket1
 
 get_om_db_size() {
   execute_command_in_container ${OM} find /data/metadata/om.db -name '*.sst' -exec du -b {} + \
-      | awk '{ sum += $1}  END { print sum }'
+      | awk '{ sum += $1 } END { print sum + 0 }'
 }
 
 check_om_log() {
@@ -117,10 +119,41 @@ compact_om_db() {
   done
 }
 
+# Wait until the background deletion pipeline stops writing new SST files,
+# so the size is measured on a stable DB and not a moving target.
+wait_db_size_stable() {
+  local prev=-1 cur
+  for _ in $(seq 1 20); do
+    cur=$(get_om_db_size)
+    if [[ "${cur}" -eq "${prev}" ]]; then
+      return 0
+    fi
+    prev=${cur}
+    sleep 3
+  done
+  return 1
+}
+
+echo "Waiting for background deletion to settle before measuring"
+retry wait_db_size_stable
+
+# Restart again after the delete so tombstones are flushed to SST before
+# measuring. Compaction flushes the memtable, so without this the "before"
+# snapshot omits unflushed data and can appear smaller than "after".
+echo "Restarting OM after delete to flush tombstones before measuring"
+docker restart "${om_container}"
+wait_for_om_leader
+retry wait_db_size_stable
+
 declare -i size_before_compaction size_after_compaction
 size_before_compaction=$(get_om_db_size)
+echo "OM DB SST size before compaction: ${size_before_compaction}"
+
 compact_om_db fileTable deletedTable deletedDirectoryTable
+
+retry wait_db_size_stable
 size_after_compaction=$(get_om_db_size)
+echo "OM DB SST size after compaction: ${size_after_compaction}"
 
 if [[ ${size_before_compaction} -lt ${size_after_compaction} ]]; then
   echo "OM DB size should be reduced after compaction. Before: ${size_before_compaction}, After: ${size_after_compaction}"
