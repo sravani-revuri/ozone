@@ -144,7 +144,7 @@ wait_for_om_db_size_stable
 size_after_compaction=$(get_om_db_size)
 echo "OM DB SST size after compaction: ${size_after_compaction}"
 
-if (( size_after_compaction * 100 > size_before_compaction * 110 )); then
+if [[ ${size_before_compaction} -lt ${size_after_compaction} ]]; then
   echo "OM DB size should be reduced after compaction. Before: ${size_before_compaction}, After: ${size_after_compaction}"
   exit 1
 fi
