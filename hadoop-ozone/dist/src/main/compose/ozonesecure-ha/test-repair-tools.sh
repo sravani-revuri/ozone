@@ -98,6 +98,7 @@ echo "Test keys created"
 
 echo "Restarting OM after key creation to flush and generate sst files"
 docker restart "${om_container}"
+# Delete keys to create tombstones that need compaction
 execute_command_in_container ${OM} ozone fs -rm -R -skipTrash ofs://${OM_SERVICE_ID}/vol1/bucket1
 
 get_om_db_size() {
@@ -113,20 +114,15 @@ get_cf_entry_count() {
 }
 
 wait_for_bucket_deletion_complete() {
-  local timeout=300
-  local file_count dir_count deleted_count deleted_dir_count
+  local timeout=300 n cf
+  local cfs=(fileTable directoryTable deletedTable deletedDirectoryTable)
   SECONDS=0
   while [[ $SECONDS -lt $timeout ]]; do
-    file_count=$(get_cf_entry_count fileTable)
-    dir_count=$(get_cf_entry_count directoryTable)
-    deleted_count=$(get_cf_entry_count deletedTable)
-    deleted_dir_count=$(get_cf_entry_count deletedDirectoryTable)
-    if [[ "${file_count:-1}" -eq 0 && "${dir_count:-1}" -eq 0 \
-          && "${deleted_count:-1}" -eq 0 && "${deleted_dir_count:-1}" -eq 0 ]]; then
-      echo "Bucket deletion complete (fileTable=0, directoryTable=0, deletedTable=0, deletedDirectoryTable=0)"
-      return 0
-    fi
-    echo "Waiting for deletion to complete: fileTable=${file_count}, directoryTable=${dir_count}, deletedTable=${deleted_count}, deletedDirectoryTable=${deleted_dir_count}"
+    for cf in "${cfs[@]}"; do
+      n=$(get_cf_entry_count "${cf}")
+      [[ "${n:-1}" -eq 0 ]] || continue 2
+    done
+    return 0
     sleep 3
   done
   echo "Timed out waiting for bucket deletion to complete"
@@ -173,19 +169,15 @@ compact_om_db() {
 
 declare -i size_before_compaction size_after_compaction
 wait_for_bucket_deletion_complete || exit 1
-wait_for_om_db_size_stable || exit 1
+
 size_before_compaction=$(get_om_db_size)
 echo "OM DB SST size before compaction: ${size_before_compaction}"
-
 compact_om_db fileTable directoryTable deletedTable deletedDirectoryTable || exit 1
 
-wait_for_om_db_size_stable || exit 1
 size_after_compaction=$(get_om_db_size)
-echo "OM DB SST size after compaction: ${size_after_compaction}"
 
+echo "OM DB SST size after compaction: ${size_after_compaction}"
 if (( size_after_compaction >= size_before_compaction )); then
   echo "OM DB size should be reduced after compaction. Before: ${size_before_compaction}, After: ${size_after_compaction}"
   exit 1
 fi
-
-echo "OM DB compaction test completed successfully."
