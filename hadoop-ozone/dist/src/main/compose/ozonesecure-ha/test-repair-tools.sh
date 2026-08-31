@@ -112,21 +112,24 @@ get_cf_entry_count() {
       | tr -d '[:space:]'
 }
 
-wait_for_deletes_drained() {
+wait_for_bucket_deletion_complete() {
   local timeout=300
-  local deleted_count deleted_dir_count
+  local file_count dir_count deleted_count deleted_dir_count
   SECONDS=0
   while [[ $SECONDS -lt $timeout ]]; do
+    file_count=$(get_cf_entry_count fileTable)
+    dir_count=$(get_cf_entry_count directoryTable)
     deleted_count=$(get_cf_entry_count deletedTable)
     deleted_dir_count=$(get_cf_entry_count deletedDirectoryTable)
-    if [[ "${deleted_count:-1}" -eq 0 && "${deleted_dir_count:-1}" -eq 0 ]]; then
-      echo "Delete queues drained (deletedTable=0, deletedDirectoryTable=0)"
+    if [[ "${file_count:-1}" -eq 0 && "${dir_count:-1}" -eq 0 \
+          && "${deleted_count:-1}" -eq 0 && "${deleted_dir_count:-1}" -eq 0 ]]; then
+      echo "Bucket deletion complete (fileTable=0, directoryTable=0, deletedTable=0, deletedDirectoryTable=0)"
       return 0
     fi
-    echo "Waiting for delete queues to drain: deletedTable=${deleted_count}, deletedDirectoryTable=${deleted_dir_count}"
+    echo "Waiting for deletion to complete: fileTable=${file_count}, directoryTable=${dir_count}, deletedTable=${deleted_count}, deletedDirectoryTable=${deleted_dir_count}"
     sleep 3
   done
-  echo "Timed out waiting for delete queues to drain (deletedTable=${deleted_count}, deletedDirectoryTable=${deleted_dir_count})"
+  echo "Timed out waiting for bucket deletion to complete"
   return 1
 }
 
@@ -169,7 +172,7 @@ compact_om_db() {
 }
 
 declare -i size_before_compaction size_after_compaction
-wait_for_deletes_drained || exit 1
+wait_for_bucket_deletion_complete || exit 1
 wait_for_om_db_size_stable || exit 1
 size_before_compaction=$(get_om_db_size)
 echo "OM DB SST size before compaction: ${size_before_compaction}"
