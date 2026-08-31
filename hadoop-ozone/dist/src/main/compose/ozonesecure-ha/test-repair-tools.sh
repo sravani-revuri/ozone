@@ -105,6 +105,31 @@ get_om_db_size() {
       | awk '{ sum += $1 } END { print sum + 0 }'
 }
 
+get_cf_entry_count() {
+  local cf="$1"
+  execute_command_in_container ${OM} bash -c \
+      "ozone debug ldb --db=/data/metadata/om.db scan --cf=${cf} --count 2>/dev/null" \
+      | tr -d '[:space:]'
+}
+
+wait_for_deletes_drained() {
+  local timeout=300
+  local deleted_count deleted_dir_count
+  SECONDS=0
+  while [[ $SECONDS -lt $timeout ]]; do
+    deleted_count=$(get_cf_entry_count deletedTable)
+    deleted_dir_count=$(get_cf_entry_count deletedDirectoryTable)
+    if [[ "${deleted_count:-1}" -eq 0 && "${deleted_dir_count:-1}" -eq 0 ]]; then
+      echo "Delete queues drained (deletedTable=0, deletedDirectoryTable=0)"
+      return 0
+    fi
+    echo "Waiting for delete queues to drain: deletedTable=${deleted_count}, deletedDirectoryTable=${deleted_dir_count}"
+    sleep 3
+  done
+  echo "Timed out waiting for delete queues to drain (deletedTable=${deleted_count}, deletedDirectoryTable=${deleted_dir_count})"
+  return 1
+}
+
 wait_for_om_db_size_stable() {
   local timeout=180
   local stable_reads=0
@@ -136,22 +161,26 @@ check_om_log() {
 compact_om_db() {
   for cf in "$@"; do
     execute_command_in_container ${OM} ozone repair om compact --cf="${cf}" --service-id "${OM_SERVICE_ID}" --node-id "${OM}" --blc kForce
-    RETRY_ATTEMPTS=20 retry check_om_log "$cf"
+    if ! RETRY_ATTEMPTS=20 retry check_om_log "$cf"; then
+      echo "Compaction did not complete for column family ${cf}"
+      return 1
+    fi
   done
 }
 
 declare -i size_before_compaction size_after_compaction
-wait_for_om_db_size_stable
+wait_for_deletes_drained || exit 1
+wait_for_om_db_size_stable || exit 1
 size_before_compaction=$(get_om_db_size)
 echo "OM DB SST size before compaction: ${size_before_compaction}"
 
-compact_om_db fileTable deletedTable deletedDirectoryTable
+compact_om_db fileTable directoryTable deletedTable deletedDirectoryTable || exit 1
 
-wait_for_om_db_size_stable
+wait_for_om_db_size_stable || exit 1
 size_after_compaction=$(get_om_db_size)
 echo "OM DB SST size after compaction: ${size_after_compaction}"
 
-if [[ ${size_before_compaction} -lt ${size_after_compaction} ]]; then
+if (( size_after_compaction >= size_before_compaction )); then
   echo "OM DB size should be reduced after compaction. Before: ${size_before_compaction}, After: ${size_after_compaction}"
   exit 1
 fi
