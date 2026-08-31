@@ -106,16 +106,23 @@ get_om_db_size() {
 }
 
 wait_for_om_db_size_stable() {
-  local timeout=120
+  local timeout=180
+  local stable_reads=0
+  local required_stable_reads=3
   local prev=-1
   SECONDS=0
   while [[ $SECONDS -lt $timeout ]]; do
     local size
     size=$(get_om_db_size)
     if [[ ${size} -eq ${prev} ]]; then
-      return 0
+      stable_reads=$((stable_reads + 1))
+      if [[ ${stable_reads} -ge ${required_stable_reads} ]]; then
+        return 0
+      fi
+    else
+      stable_reads=0
+      prev=${size}
     fi
-    prev=${size}
     sleep 3
   done
   echo "Timed out waiting for OM DB size to stabilize"
@@ -129,7 +136,7 @@ check_om_log() {
 compact_om_db() {
   for cf in "$@"; do
     execute_command_in_container ${OM} ozone repair om compact --cf="${cf}" --service-id "${OM_SERVICE_ID}" --node-id "${OM}" --blc kForce
-    RETRY_ATTEMPTS=10 retry check_om_log "$cf"
+    RETRY_ATTEMPTS=20 retry check_om_log "$cf"
   done
 }
 
